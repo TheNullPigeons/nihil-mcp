@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "nihil": {
+      "command": "nihil-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
