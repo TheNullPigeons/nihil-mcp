@@ -1,6 +1,10 @@
 """Nihil MCP Server — expose Nihil container operations to LLM agents."""
 
+import io
+import json
 import sys
+import tarfile
+from pathlib import Path
 from typing import Optional
 
 import docker
@@ -8,10 +12,10 @@ from mcp.server.fastmcp import FastMCP
 
 NIHIL_REGISTRY = "thenullpigeons"
 AVAILABLE_IMAGES = {
-    "full": "ghcr.io/thenullpigeons/full:latest",
-    "ad": "ghcr.io/thenullpigeons/ad:latest",
-    "web": "ghcr.io/thenullpigeons/web:latest",
-    "ctf": "ghcr.io/thenullpigeons/ctf:latest",
+    "full":     "ghcr.io/thenullpigeons/full:latest",
+    "ad":       "ghcr.io/thenullpigeons/ad:latest",
+    "web":      "ghcr.io/thenullpigeons/web:latest",
+    "blueteam": "ghcr.io/thenullpigeons/blueteam:latest",
 }
 EXEC_TIMEOUT = 60
 EXEC_OUTPUT_LIMIT = 32_000
@@ -22,7 +26,10 @@ mcp = FastMCP(
         "You have access to Nihil pentest containers. "
         "Use these tools to manage containers and execute security tools inside them. "
         "Always work inside a container — never on the host system. "
-        "Containers are isolated environments pre-loaded with pentest tools."
+        "Containers are isolated environments pre-loaded with pentest tools. "
+        "Available image variants: full (all tools), ad (Active Directory), "
+        "web (web hacking), blueteam (DFIR, threat hunting, SOC). "
+        "If an image is not installed locally, use pull_image first."
     ),
 )
 
@@ -38,7 +45,7 @@ def _get_client() -> docker.DockerClient:
 
 def _is_nihil_container(container) -> bool:
     image = container.attrs.get("Config", {}).get("Image", "")
-    return NIHIL_REGISTRY in image
+    return NIHIL_REGISTRY in image or image.startswith("nihil/")
 
 
 def _container_status(container) -> dict:
@@ -56,6 +63,7 @@ def _container_status(container) -> dict:
         "name": container.name,
         "status": container.status,
         "image": image_short,
+        "privileged": attrs.get("HostConfig", {}).get("Privileged", False),
         "vpn": env.get("NIHIL_VPN", "0") == "1",
         "browser_ui": env.get("NIHIL_BROWSER_UI", "0") == "1",
         "browser_ui_port": env.get("NIHIL_BROWSER_UI_PORT"),
@@ -96,14 +104,17 @@ def start_container(
     image: str = "full",
     workspace: Optional[str] = None,
     network: str = "host",
+    privileged: bool = False,
 ) -> dict:
     """Create and start a new Nihil pentest container.
 
     Args:
         name: Container name (e.g. "pentest-htb")
-        image: Image variant — full, ad, web, ctf (default: full)
-        workspace: Host path to mount as /workspace inside the container (optional)
+        image: Image variant — full, ad, web, blueteam (default: full)
+        workspace: Host path to mount as /workspace inside the container.
+                   Created automatically at ~/.nihil/workspaces/<name> if not specified.
         network: Network mode — host, bridge, none (default: host)
+        privileged: Run container in privileged mode (needed for some tools like nmap raw sockets)
     """
     if image not in AVAILABLE_IMAGES:
         raise ValueError(f"Unknown image '{image}'. Choose from: {', '.join(AVAILABLE_IMAGES)}")
@@ -123,28 +134,31 @@ def start_container(
         client.images.get(image_tag)
     except docker.errors.ImageNotFound:
         raise RuntimeError(
-            f"Image '{image_tag}' not found locally. Pull it first with: nihil install {image}"
+            f"Image '{image_tag}' not found locally. Pull it first with pull_image('{image}')"
         )
+
+    if workspace is None:
+        default_ws = Path.home() / ".nihil" / "workspaces" / name
+        default_ws.mkdir(parents=True, exist_ok=True)
+        workspace = str(default_ws)
 
     volumes = {}
     if workspace:
-        from pathlib import Path
         ws_path = Path(workspace).expanduser().resolve()
         if not ws_path.exists():
             raise ValueError(f"Workspace path does not exist: {workspace}")
         volumes[str(ws_path)] = {"bind": "/workspace", "mode": "rw"}
 
-    config: dict = {
-        "name": name,
-        "image": image_tag,
-        "detach": True,
-        "tty": True,
-        "stdin_open": True,
-        "network_mode": network,
-        "volumes": volumes,
-    }
-
-    container = client.containers.create(**config)
+    container = client.containers.create(
+        name=name,
+        image=image_tag,
+        detach=True,
+        tty=True,
+        stdin_open=True,
+        network_mode=network,
+        privileged=privileged,
+        volumes=volumes,
+    )
     container.start()
     container.reload()
     return {
@@ -152,6 +166,8 @@ def start_container(
         "name": container.name,
         "status": container.status,
         "image": image,
+        "workspace": workspace,
+        "privileged": privileged,
     }
 
 
@@ -174,6 +190,25 @@ def stop_container(name: str) -> dict:
 
 
 @mcp.tool()
+def remove_container(name: str, force: bool = False) -> dict:
+    """Remove a Nihil container (must be stopped first unless force=True).
+
+    Args:
+        name: Container name
+        force: Force removal even if the container is running (default: False)
+    """
+    client = _get_client()
+    try:
+        container = client.containers.get(name)
+    except docker.errors.NotFound:
+        raise ValueError(f"Container '{name}' not found")
+    if not _is_nihil_container(container):
+        raise ValueError(f"'{name}' is not a Nihil container")
+    container.remove(force=force)
+    return {"removed": True, "name": name}
+
+
+@mcp.tool()
 def exec_command(
     name: str,
     command: str,
@@ -184,10 +219,11 @@ def exec_command(
 
     Use this to run pentest tools, enumerate targets, or inspect results.
     The container must be running. Output is capped at 32 000 characters.
+    Commands run in zsh with the full container environment (PATH, tool aliases, etc.).
 
     Args:
         name: Container name
-        command: Shell command to run (executed via /bin/sh -c)
+        command: Shell command to run
         workdir: Working directory inside the container (default: /workspace)
         timeout: Timeout in seconds (default: 60, max: 300)
     """
@@ -205,12 +241,12 @@ def exec_command(
         raise ValueError(f"Container '{name}' is not running (status: {container.status})")
 
     exit_code, output = container.exec_run(
-        cmd=["/bin/sh", "-c", command],
+        cmd=["/usr/bin/zsh", "-c", command],
         workdir=workdir,
         demux=False,
         stream=False,
         socket=False,
-        environment={"TERM": "dumb"},
+        environment={"TERM": "dumb", "HOME": "/root"},
     )
 
     raw = output.decode("utf-8", errors="replace") if output else ""
@@ -251,14 +287,40 @@ def list_images() -> list[dict]:
 
 
 @mcp.tool()
+def pull_image(image: str) -> dict:
+    """Pull a Nihil image from the registry (ghcr.io/thenullpigeons).
+
+    Use this before start_container if the image is not installed locally.
+    This may take several minutes depending on the image size.
+
+    Args:
+        image: Image variant to pull — full, ad, web, blueteam
+    """
+    if image not in AVAILABLE_IMAGES:
+        raise ValueError(f"Unknown image '{image}'. Choose from: {', '.join(AVAILABLE_IMAGES)}")
+
+    client = _get_client()
+    tag = AVAILABLE_IMAGES[image]
+    client.images.pull(tag)
+    img = client.images.get(tag)
+    size_mb = round(img.attrs.get("Size", 0) / 1024 / 1024)
+    return {
+        "pulled": True,
+        "variant": image,
+        "tag": tag,
+        "size_mb": size_mb,
+    }
+
+
+@mcp.tool()
 def list_tools(image: str = "full", category: Optional[str] = None) -> dict:
     """List pentest tools available in a Nihil image.
 
     Reads the tools.json manifest embedded in the image. Optionally filter by category.
 
     Args:
-        image: Image variant — full, ad, web, ctf (default: full)
-        category: Filter by category name (optional, e.g. "network", "web", "ad")
+        image: Image variant — full, ad, web, blueteam (default: full)
+        category: Filter by category name (optional, e.g. "network", "web", "ad", "mod_hunt", "mod_dfir")
     """
     if image not in AVAILABLE_IMAGES:
         raise ValueError(f"Unknown image '{image}'. Choose from: {', '.join(AVAILABLE_IMAGES)}")
@@ -266,13 +328,9 @@ def list_tools(image: str = "full", category: Optional[str] = None) -> dict:
     client = _get_client()
     tag = AVAILABLE_IMAGES[image]
     try:
-        img = client.images.get(tag)
+        client.images.get(tag)
     except docker.errors.ImageNotFound:
-        raise RuntimeError(f"Image '{tag}' not installed. Run: nihil install {image}")
-
-    import io
-    import json
-    import tarfile
+        raise RuntimeError(f"Image '{tag}' not installed. Run: pull_image('{image}')")
 
     try:
         tmp = client.containers.create(image=tag, command="true")
