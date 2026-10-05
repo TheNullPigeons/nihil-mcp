@@ -29,20 +29,25 @@ _SESSION_BASE = "/tmp/.nihil_mcp"
 _sessions: dict[str, str] = {}
 _sessions_lock = threading.Lock()
 
-# System env vars that should not be persisted across session commands
-_ENV_BLACKLIST_RE = re.compile(
-    r"^typeset -x ("
-    r"HOME|PATH|TERM|SHELL|SHLVL|OLDPWD|PWD|_|LOGNAME|USER|MAIL|"
-    r"LANG|LC_ALL|LC_[A-Z]+|LS_COLORS|COLORTERM|TMPDIR|TEMP|TMP|"
-    r"HISTFILE|HISTSIZE|SAVEHIST|ZDOTDIR|ZSH|NVM_DIR|PYENV_ROOT|"
-    r"GOPATH|GOBIN|JAVA_HOME|NIHIL_BUILD|NIHIL_AUDIT"
-    r")="
-)
-
 # ANSI escape codes (colors, cursor moves, etc.)
 _ANSI_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
-# Session exec script template — uses __PLACEHOLDER__ to avoid .format() issues
+# Per-invocation volatile exports to drop from the persisted session env.
+# zsh re-derives these on every `zsh -c`, so carrying them over is noise
+# (or actively wrong, e.g. a stale PWD). Everything else is handled by the
+# baseline diff below, which is why this stays a tiny list and not a blacklist.
+_VOLATILE_ENV = "_|PWD|OLDPWD|SHLVL|RANDOM|SECONDS|LINENO|COLUMNS|LINES|EPOCHSECONDS|EPOCHREALTIME"
+
+# Shell snapshot taken at create_session: the container's pristine exported env,
+# sorted so the per-command script can diff against it with `comm`.
+_BASELINE_SCRIPT = 'mkdir -p "__SESSION_DIR__" && typeset -xp 2>/dev/null | sort > "__SESSION_DIR__/baseline"'
+
+# Session exec script template — uses __PLACEHOLDER__ to avoid .format() issues.
+# Env persistence is an allowlist-by-diff: we keep only exports that are new or
+# changed relative to the baseline (i.e. what the user/tools exported, like
+# TARGET=...), minus the volatile set. This is robust against zsh's flagged
+# exports (`export -T PATH ...`, `export -i10 SHLVL=1`) and against system vars
+# that a static blacklist would never anticipate.
 _SESSION_SCRIPT = """\
 _SD="__SESSION_DIR__"
 mkdir -p "$_SD"
@@ -51,11 +56,11 @@ mkdir -p "$_SD"
 __COMMAND__
 _RC=$?
 pwd > "$_SD/cwd"
-typeset -xp 2>/dev/null | grep -vE \
-  '^typeset -x (HOME|PATH|TERM|SHELL|SHLVL|OLDPWD|PWD|_|LOGNAME|USER|MAIL|LANG|LC_[A-Z]*|LS_COLORS|COLORTERM|TMPDIR|TEMP|TMP|HISTFILE|HISTSIZE|SAVEHIST|ZDOTDIR|ZSH|NVM_DIR|PYENV_ROOT|GOPATH|GOBIN|JAVA_HOME|NIHIL_BUILD|NIHIL_AUDIT)=' \
-  > "$_SD/env" 2>/dev/null || true
+if [[ -f "$_SD/baseline" ]]; then
+  typeset -xp 2>/dev/null | sort | comm -13 "$_SD/baseline" - | grep -vE '^export (-[^ ]+ )?(__VOLATILE__)[=(]' > "$_SD/env" 2>/dev/null || true
+fi
 exit $_RC
-"""
+""".replace("__VOLATILE__", _VOLATILE_ENV)
 
 
 def _clean_output(text: str) -> str:
@@ -66,10 +71,26 @@ def _clean_output(text: str) -> str:
     return text.strip()
 
 
-def _run(container, cmd: str, workdir: str = "/workspace") -> tuple[int, str]:
-    """Execute a zsh command in a container and return (exit_code, cleaned_output)."""
+def _run(
+    container,
+    cmd: str,
+    workdir: str = "/workspace",
+    timeout: Optional[int] = None,
+) -> tuple[int, str]:
+    """Execute a zsh command in a container and return (exit_code, cleaned_output).
+
+    When *timeout* is set, the command is wrapped with coreutils ``timeout`` so a
+    hanging command (an interactive prompt, a scan that never returns) is killed
+    container-side instead of blocking the MCP server indefinitely. ``timeout``
+    sends SIGTERM after *timeout* seconds, then SIGKILL 5s later; a killed
+    command surfaces exit code 124.
+    """
+    if timeout is not None:
+        exec_cmd = ["/usr/bin/timeout", "-k", "5", str(timeout), "/usr/bin/zsh", "-c", cmd]
+    else:
+        exec_cmd = ["/usr/bin/zsh", "-c", cmd]
     exit_code, output = container.exec_run(
-        cmd=["/usr/bin/zsh", "-c", cmd],
+        cmd=exec_cmd,
         workdir=workdir,
         demux=False,
         stream=False,
@@ -78,9 +99,10 @@ def _run(container, cmd: str, workdir: str = "/workspace") -> tuple[int, str]:
     )
     raw = output.decode("utf-8", errors="replace") if output else ""
     cleaned = _clean_output(raw)
-    truncated = len(cleaned) > EXEC_OUTPUT_LIMIT
-    if truncated:
+    if len(cleaned) > EXEC_OUTPUT_LIMIT:
         cleaned = cleaned[:EXEC_OUTPUT_LIMIT] + f"\n... [truncated at {EXEC_OUTPUT_LIMIT} chars]"
+    if exit_code == 124:
+        cleaned += f"\n... [command timed out after {timeout}s and was killed]"
     return exit_code, cleaned
 
 
@@ -305,7 +327,7 @@ def exec_command(
     if container.status != "running":
         raise ValueError(f"Container '{name}' is not running (status: {container.status})")
 
-    exit_code, cleaned = _run(container, command, workdir=workdir)
+    exit_code, cleaned = _run(container, command, workdir=workdir, timeout=timeout)
     return {
         "exit_code": exit_code,
         "output": cleaned,
@@ -338,8 +360,8 @@ def create_session(name: str) -> dict:
     session_id = uuid.uuid4().hex[:12]
     session_dir = f"{_SESSION_BASE}/{session_id}"
 
-    # Init session dir inside the container
-    _run(container, f"mkdir -p {session_dir}", workdir="/root")
+    # Init session dir and snapshot the pristine env as the diff baseline
+    _run(container, _BASELINE_SCRIPT.replace("__SESSION_DIR__", session_dir), workdir="/root")
 
     with _sessions_lock:
         _sessions[session_id] = name
@@ -384,7 +406,7 @@ def exec_in_session(session_id: str, command: str, timeout: int = EXEC_TIMEOUT) 
         .replace("__COMMAND__", command)
     )
 
-    exit_code, cleaned = _run(container, script, workdir="/root")
+    exit_code, cleaned = _run(container, script, workdir="/root", timeout=timeout)
     return {
         "exit_code": exit_code,
         "output": cleaned,
