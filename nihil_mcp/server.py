@@ -3,11 +3,16 @@
 import io
 import json
 import re
+import socket
+import struct
 import tarfile
 import threading
 import uuid
+import zlib
+from base64 import b64encode
 from pathlib import Path
 from typing import Optional
+from urllib.request import urlopen
 
 import docker
 from mcp.server.fastmcp import FastMCP
@@ -21,6 +26,8 @@ AVAILABLE_IMAGES = {
 }
 EXEC_TIMEOUT = 60
 EXEC_OUTPUT_LIMIT = 32_000
+_BROWSER_UI_HOST = "127.0.0.1"
+_RFB_PORT = 5901
 
 # Session state is stored inside the container at this path
 _SESSION_BASE = "/tmp/.nihil_mcp"
@@ -118,7 +125,10 @@ mcp = FastMCP(
         "For multi-step operations use create_session + exec_in_session to preserve "
         "working directory and environment variables across commands. "
         "Use exec_command for one-off commands that need no state. "
-        "If an image is not installed locally, use pull_image first."
+        "If an image is not installed locally, use pull_image first. "
+        "For visual control of a container that has Browser UI enabled, use "
+        "browser_ui_screenshot to inspect the desktop, then browser_ui_click and "
+        "browser_ui_type to interact; coordinates use the 1280x720 desktop."
     ),
 )
 
@@ -172,6 +182,122 @@ def _container_status(container) -> dict:
         "browser_ui_port": env.get("NIHIL_BROWSER_UI_PORT"),
         "mounts": mounts,
     }
+
+
+def _browser_ui(container_name: str):
+    """Return the authenticated RFB endpoint for the container's Browser UI."""
+    client = _get_client()
+    container = _get_nihil_container(client, container_name)
+    if container.status != "running":
+        raise ValueError(f"Container '{container_name}' is not running (status: {container.status})")
+    env = dict(kv.split("=", 1) for kv in container.attrs.get("Config", {}).get("Env", []) if "=" in kv)
+    if env.get("NIHIL_BROWSER_UI") != "1":
+        raise ValueError(f"Browser UI is not enabled for container '{container_name}'")
+    port = int(env.get("NIHIL_BROWSER_UI_PORT", "6901"))
+    url = f"http://{_BROWSER_UI_HOST}:{port}/"
+    try:
+        with urlopen(url, timeout=3) as response:
+            if response.status != 200:
+                raise RuntimeError(f"Browser UI returned HTTP {response.status}")
+    except Exception as e:
+        raise RuntimeError(f"Browser UI on '{container_name}' is not reachable at {url}: {e}") from e
+    if not env.get("NIHIL_BROWSER_UI_PASSWORD"):
+        raise RuntimeError("Browser UI password is missing from the container configuration")
+    return env["NIHIL_BROWSER_UI_PASSWORD"]
+
+
+class _RFB:
+    """Small RFB 3.8 client for authenticated screenshots and input events."""
+
+    def __init__(self, password: str):
+        self.sock = socket.create_connection((_BROWSER_UI_HOST, _RFB_PORT), timeout=5)
+        self.sock.settimeout(10)
+        self._read(12)
+        self.sock.sendall(b"RFB 003.008\n")
+        count = self._read(1)[0]
+        security_types = self._read(count)
+        if 2 not in security_types:
+            raise RuntimeError("VNC server does not offer password authentication")
+        self.sock.sendall(b"\x02")
+        challenge = self._read(16)
+        key = password.encode()[:8].ljust(8, b"\0")
+        key = bytes(int(f"{byte:08b}"[::-1], 2) for byte in key)
+        try:
+            from Crypto.Cipher import DES
+            response = DES.new(key, DES.MODE_ECB).encrypt(challenge)
+        except ImportError as e:
+            raise RuntimeError("VNC authentication requires pycryptodome") from e
+        self.sock.sendall(response)
+        if struct.unpack(">I", self._read(4))[0] != 0:
+            raise RuntimeError("VNC authentication failed")
+        self.sock.sendall(b"\x01")  # shared session
+        server_init = self._read(24)
+        self.width, self.height = struct.unpack(">HH", server_init[:4])
+        name_len = struct.unpack(">I", server_init[20:24])[0]
+        self._read(name_len)
+        # Request 32-bit little-endian RGBX, then raw rectangles.
+        pixel_format = b"\x20\x18\x00\x01" + struct.pack(">HHH", 255, 255, 255) + b"\x10\x08\x00\x00\x00\x00"
+        self.sock.sendall(b"\x00" + b"\x00" * 3 + pixel_format)
+        self.sock.sendall(b"\x02\x00\x00\x01\x00\x00\x00\x00")
+
+    def _read(self, size: int) -> bytes:
+        data = bytearray()
+        while len(data) < size:
+            chunk = self.sock.recv(size - len(data))
+            if not chunk:
+                raise RuntimeError("VNC connection closed unexpectedly")
+            data.extend(chunk)
+        return bytes(data)
+
+    def screenshot(self) -> bytes:
+        self.sock.sendall(b"\x03\x00" + struct.pack(">HHHH", 0, 0, self.width, self.height))
+        pixels = bytearray(self.width * self.height * 4)
+        while True:
+            header = self._read(4)
+            if header[0] != 0:
+                raise RuntimeError(f"Unsupported VNC server message: {header[0]}")
+            rect_count = struct.unpack(">H", header[2:])[0]
+            for _ in range(rect_count):
+                x, y, width, height, encoding = struct.unpack(">HHHHi", self._read(12))
+                if encoding == -223:
+                    self.width, self.height = width, height
+                    pixels = bytearray(width * height * 4)
+                elif encoding == 0:
+                    for row in range(height):
+                        raw = bytearray(self._read(width * 4))
+                        for i in range(0, len(raw), 4):
+                            raw[i], raw[i + 2] = raw[i + 2], raw[i]
+                        pixels[((y + row) * self.width + x) * 4:((y + row) * self.width + x + width) * 4] = raw
+                elif encoding == 1:
+                    src_x, src_y = struct.unpack(">HH", self._read(4))
+                    row_bytes = width * 4
+                    for row in range(height):
+                        src = ((src_y + row) * self.width + src_x) * 4
+                        dst = ((y + row) * self.width + x) * 4
+                        pixels[dst:dst + row_bytes] = pixels[src:src + row_bytes]
+                else:
+                    raise RuntimeError(f"Unsupported VNC encoding: {encoding}")
+            if rect_count:
+                break
+        # Emit a PNG using stdlib zlib.
+        rows = bytearray()
+        for y in range(self.height):
+            rows.append(0)
+            for x in range(self.width):
+                i = (y * self.width + x) * 4
+                rows.extend((pixels[i], pixels[i + 1], pixels[i + 2]))
+        def chunk(kind: bytes, data: bytes) -> bytes:
+            return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
+        return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", self.width, self.height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b"")
+
+    def pointer(self, x: int, y: int, mask: int = 0) -> None:
+        self.sock.sendall(b"\x05" + bytes([mask]) + struct.pack(">HH", x, y))
+
+    def key(self, keysym: int, down: bool) -> None:
+        self.sock.sendall(b"\x04" + bytes([int(down)]) + b"\0\0" + struct.pack(">I", keysym))
+
+    def close(self) -> None:
+        self.sock.close()
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +540,81 @@ def exec_in_session(session_id: str, command: str, timeout: int = EXEC_TIMEOUT) 
         "session_id": session_id,
         "container": container_name,
     }
+
+
+# ---------------------------------------------------------------------------
+# Browser UI — visual interaction with noVNC desktops
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def browser_ui_screenshot(name: str) -> dict:
+    """Capture the visible desktop in a running container with Browser UI enabled.
+
+    Returns a base64 PNG screenshot for visual inspection.
+    Args:
+        name: Nihil container name
+    """
+    password = _browser_ui(name)
+    rfb = _RFB(password)
+    try:
+        return {"container": name, "image": b64encode(rfb.screenshot()).decode("ascii"), "mime_type": "image/png", "width": rfb.width, "height": rfb.height}
+    finally:
+        rfb.close()
+
+
+@mcp.tool()
+def browser_ui_click(name: str, x: int, y: int, button: str = "left") -> dict:
+    """Click a point on the remote desktop (coordinates use screenshot pixels).
+
+    Args:
+        name: Nihil container name
+        x: Horizontal coordinate, 0–1279
+        y: Vertical coordinate, 0–719
+        button: Mouse button: left, middle, or right
+    """
+    if button not in ("left", "middle", "right"):
+        raise ValueError("button must be left, middle, or right")
+    password = _browser_ui(name)
+    rfb = _RFB(password)
+    try:
+        if not (0 <= x < rfb.width and 0 <= y < rfb.height):
+            raise ValueError(f"Coordinates must be within the {rfb.width}x{rfb.height} desktop")
+        mask = {"left": 1, "middle": 2, "right": 4}[button]
+        rfb.pointer(x, y, mask)
+        rfb.pointer(x, y, 0)
+        return {"clicked": True, "container": name, "x": x, "y": y, "button": button}
+    finally:
+        rfb.close()
+
+
+@mcp.tool()
+def browser_ui_type(name: str, text: str) -> dict:
+    """Type literal text into the currently focused control in the Browser UI.
+
+    Args:
+        name: Nihil container name
+        text: Text to type (maximum 2000 characters)
+    """
+    if len(text) > 2000:
+        raise ValueError("text must be at most 2000 characters")
+    password = _browser_ui(name)
+    rfb = _RFB(password)
+    try:
+        for char in text:
+            keysym = ord(char)
+            if char == "\n":
+                keysym = 0xff0d
+            elif char == "\t":
+                keysym = 0xff09
+            elif char == "\b":
+                keysym = 0xff08
+            if keysym > 0xffff:
+                keysym = 0x01000000 | keysym
+            rfb.key(keysym, True)
+            rfb.key(keysym, False)
+        return {"typed": len(text), "container": name}
+    finally:
+        rfb.close()
 
 
 @mcp.tool()

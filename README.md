@@ -51,6 +51,19 @@ You can then ask Claude to manage containers and run tools:
 | `list_sessions` | List active sessions and their containers |
 | `close_session` | Close a session and clean up its state |
 
+**Browser UI**
+
+| Tool | Description |
+|---|---|
+| `browser_ui_screenshot` | Capture a PNG of the desktop in a running container with Browser UI enabled |
+| `browser_ui_click` | Click a point on the desktop using screenshot pixel coordinates |
+| `browser_ui_type` | Type literal text into the focused desktop control |
+
+These tools connect to the container's authenticated VNC server directly. They
+require `NIHIL_BROWSER_UI=1`, the Browser UI password in the container
+configuration and `pycryptodome` for VNC authentication. No browser installation
+is needed on the MCP host.
+
 **Images**
 
 | Tool | Description |
